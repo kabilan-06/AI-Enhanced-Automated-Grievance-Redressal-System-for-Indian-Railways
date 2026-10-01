@@ -4,7 +4,7 @@ import API from "../api";
 import { AuthContext } from "../context/AuthContext";
 
 const SECTIONS = ["Overview", "All Users", "Create User", "Complaints"];
-const ICONS = { Overview: "OV", "All Users": "US", "Create User": "+", Complaints: "CP" };
+const ICONS = { Overview: "📊", "All Users": "👥", "Create User": "➕", Complaints: "📋" };
 
 const ROLES = ["USER", "STATION_MASTER", "STATION_STAFF", "RPF_ADMIN", "SUPER_ADMIN"];
 const ROLE_COLORS = {
@@ -34,6 +34,8 @@ const SuperAdminDashboard = () => {
     const [editData, setEditData] = useState({});
     const [searchTerm, setSearchTerm] = useState("");
     const [filterRole, setFilterRole] = useState("");
+    const [complaintStatusFilter, setComplaintStatusFilter] = useState("ALL");
+    const [complaintDeptFilter, setComplaintDeptFilter] = useState("");
 
     const handleLogout = () => {
         logout();
@@ -79,6 +81,7 @@ const SuperAdminDashboard = () => {
             const payload = {
                 role: (editData.role || "").toUpperCase(),
                 stationName: editData.stationName ?? "",
+                trainNumber: editData.trainNumber ?? "",
             };
             const res = await API.patch(`/superadmin/users/${id}`, payload);
             setUsers(prev => prev.map(u => (u.id === id ? { ...u, ...res.data } : u)));
@@ -102,6 +105,16 @@ const SuperAdminDashboard = () => {
         }
     };
 
+    const handleDeleteComplaint = async (id) => {
+        if (!window.confirm("Delete this complaint permanently?")) return;
+        try {
+            await API.delete(`/complaints/${id}`);
+            setComplaints(prev => prev.filter(c => c.id !== id));
+        } catch (err) {
+            window.alert(err.response?.data?.message || "Failed to delete complaint.");
+        }
+    };
+
     const filteredUsers = users.filter((u) => {
         const matchSearch = searchTerm
             ? (u.username || "").toLowerCase().includes(searchTerm.toLowerCase()) ||
@@ -117,6 +130,14 @@ const SuperAdminDashboard = () => {
         if (deptA !== deptB) return deptA.localeCompare(deptB);
         return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
     });
+    const complaintDepartments = Array.from(
+        new Set(complaints.map(c => c.department || c.category).filter(Boolean))
+    ).sort((a, b) => a.localeCompare(b));
+    const filteredComplaints = sortedComplaints.filter((c) => {
+        const statusOk = complaintStatusFilter === "ALL" ? true : c.status === complaintStatusFilter;
+        const deptOk = complaintDeptFilter ? (c.department || c.category || "") === complaintDeptFilter : true;
+        return statusOk && deptOk;
+    });
 
     const resolutionRate = complaints.length
         ? Math.round((complaints.filter(c => c.status === "RESOLVED").length / complaints.length) * 100)
@@ -129,7 +150,7 @@ const SuperAdminDashboard = () => {
                     <div className="flex items-center gap-3">
                         <div className="w-10 h-10 bg-yellow-400 rounded-full flex items-center justify-center text-sm font-bold">SA</div>
                         <div>
-                            <div className="font-bold text-white text-sm">RailMadad</div>
+                            <div className="font-bold text-white text-sm">RailPal</div>
                             <div className="text-purple-200 text-xs">Super Admin Console</div>
                         </div>
                     </div>
@@ -223,15 +244,16 @@ const SuperAdminDashboard = () => {
                                             <th className="py-3 px-4 text-left">Email</th>
                                             <th className="py-3 px-4 text-left">Role</th>
                                             <th className="py-3 px-4 text-left">Station</th>
+                                            <th className="py-3 px-4 text-left">Train No</th>
                                             <th className="py-3 px-4 text-left">Created</th>
                                             <th className="py-3 px-4 text-left">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {loading ? (
-                                            <tr><td colSpan="7" className="py-8 text-center text-gray-400">Loading...</td></tr>
+                                            <tr><td colSpan="8" className="py-8 text-center text-gray-400">Loading...</td></tr>
                                         ) : filteredUsers.length === 0 ? (
-                                            <tr><td colSpan="7" className="py-8 text-center text-gray-400">No users found.</td></tr>
+                                            <tr><td colSpan="8" className="py-8 text-center text-gray-400">No users found.</td></tr>
                                         ) : filteredUsers.map((u) => (
                                             <tr key={u.id} className="border-b hover:bg-purple-50">
                                                 <td className="py-3 px-4 text-purple-600 font-semibold">#{u.id}</td>
@@ -253,6 +275,13 @@ const SuperAdminDashboard = () => {
                                                             className="border rounded px-2 py-1 text-sm w-full" placeholder="Station name" />
                                                     ) : (u.station || "-")}
                                                 </td>
+                                                <td className="py-3 px-4">
+                                                    {editingId === u.id ? (
+                                                        <input value={editData.trainNumber ?? (u.trainNumber || "")}
+                                                            onChange={e => setEditData(prev => ({ ...prev, trainNumber: e.target.value }))}
+                                                            className="border rounded px-2 py-1 text-sm w-full" placeholder="Train no" />
+                                                    ) : (u.trainNumber || "-")}
+                                                </td>
                                                 <td className="py-3 px-4 text-gray-400">{u.createdAt?.split("T")[0] || "-"}</td>
                                                 <td className="py-3 px-4">
                                                     <div className="flex gap-2">
@@ -263,7 +292,7 @@ const SuperAdminDashboard = () => {
                                                             </>
                                                         ) : (
                                                             <>
-                                                                <button onClick={() => { setEditingId(u.id); setEditData({ role: u.role, stationName: u.station || "" }); }} className="bg-blue-100 text-blue-600 text-xs px-2 py-1 rounded hover:bg-blue-200">Edit</button>
+                                                                <button onClick={() => { setEditingId(u.id); setEditData({ role: u.role, stationName: u.station || "", trainNumber: u.trainNumber || "" }); }} className="bg-blue-100 text-blue-600 text-xs px-2 py-1 rounded hover:bg-blue-200">Edit</button>
                                                                 <button onClick={() => handleDeleteUser(u.id)} className="bg-red-100 text-red-600 text-xs px-2 py-1 rounded hover:bg-red-200">Delete</button>
                                                             </>
                                                         )}
@@ -303,45 +332,90 @@ const SuperAdminDashboard = () => {
 
                     {activeSection === "Complaints" && (
                         <div className="bg-white rounded-xl shadow">
-                            <div className="p-5 border-b flex justify-between items-center">
+                            <div className="p-5 border-b flex flex-wrap items-center gap-4">
                                 <h3 className="font-bold text-gray-800">All System Complaints</h3>
-                                <div className="flex gap-3 text-sm">
-                                    <span className="bg-red-100 text-red-700 px-3 py-1 rounded-full font-semibold">Pending: {complaints.filter(c => c.status === "PENDING").length}</span>
-                                    <span className="bg-yellow-100 text-yellow-700 px-3 py-1 rounded-full font-semibold">In Progress: {complaints.filter(c => c.status === "IN_PROGRESS").length}</span>
-                                    <span className="bg-green-100 text-green-700 px-3 py-1 rounded-full font-semibold">Resolved: {complaints.filter(c => c.status === "RESOLVED").length}</span>
+                                <div className="flex flex-wrap gap-3 text-sm ml-auto">
+                                    <button
+                                        onClick={() => setComplaintStatusFilter(prev => (prev === "PENDING" ? "ALL" : "PENDING"))}
+                                        className={`px-3 py-1 rounded-full font-semibold border ${complaintStatusFilter === "PENDING" ? "bg-red-100 text-red-700 border-red-200 shadow-sm" : "bg-white text-red-600 border-red-100"}`}
+                                    >
+                                        Pending: {complaints.filter(c => c.status === "PENDING").length}
+                                    </button>
+                                    <button
+                                        onClick={() => setComplaintStatusFilter(prev => (prev === "IN_PROGRESS" ? "ALL" : "IN_PROGRESS"))}
+                                        className={`px-3 py-1 rounded-full font-semibold border ${complaintStatusFilter === "IN_PROGRESS" ? "bg-yellow-100 text-yellow-700 border-yellow-200 shadow-sm" : "bg-white text-yellow-600 border-yellow-100"}`}
+                                    >
+                                        In Progress: {complaints.filter(c => c.status === "IN_PROGRESS").length}
+                                    </button>
+                                    <button
+                                        onClick={() => setComplaintStatusFilter(prev => (prev === "RESOLVED" ? "ALL" : "RESOLVED"))}
+                                        className={`px-3 py-1 rounded-full font-semibold border ${complaintStatusFilter === "RESOLVED" ? "bg-green-100 text-green-700 border-green-200 shadow-sm" : "bg-white text-green-600 border-green-100"}`}
+                                    >
+                                        Resolved: {complaints.filter(c => c.status === "RESOLVED").length}
+                                    </button>
                                 </div>
+                            </div>
+                            <div className="px-5 py-3 border-b flex flex-wrap items-center gap-3">
+                                <select
+                                    value={complaintDeptFilter}
+                                    onChange={e => setComplaintDeptFilter(e.target.value)}
+                                    className="border border-gray-300 rounded px-2 py-1 text-xs"
+                                >
+                                    <option value="">All Departments</option>
+                                    {complaintDepartments.map(d => <option key={d} value={d}>{d}</option>)}
+                                </select>
+                                <button
+                                    onClick={() => { setComplaintStatusFilter("ALL"); setComplaintDeptFilter(""); }}
+                                    className="px-3 py-1 rounded text-xs font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200"
+                                >
+                                    Clear Filters
+                                </button>
+                                <span className="text-xs text-gray-500 ml-auto">{filteredComplaints.length} results</span>
                             </div>
                             <div className="overflow-x-auto">
                                 <table className="min-w-full text-sm">
                                     <thead className="bg-gray-50 text-gray-600">
                                         <tr>
-                                            <th className="py-3 px-4 text-left">#ID</th>
                                             <th className="py-3 px-4 text-left">Passenger</th>
                                             <th className="py-3 px-4 text-left">Complaint</th>
                                             <th className="py-3 px-4 text-left">Department</th>
                                             <th className="py-3 px-4 text-left">Station</th>
                                             <th className="py-3 px-4 text-left">Assigned To</th>
+                                            <th className="py-3 px-4 text-left">Resolved By</th>
                                             <th className="py-3 px-4 text-left">Status</th>
                                             <th className="py-3 px-4 text-left">Date</th>
+                                            <th className="py-3 px-4 text-left">Actions</th>
                                         </tr>
                                     </thead>
                                     <tbody>
                                         {loading ? (
-                                            <tr><td colSpan="8" className="py-8 text-center text-gray-400">Loading...</td></tr>
-                                        ) : sortedComplaints.length === 0 ? (
-                                            <tr><td colSpan="8" className="py-8 text-center text-gray-400">No complaints found.</td></tr>
-                                        ) : sortedComplaints.map(c => (
+                                            <tr><td colSpan="9" className="py-8 text-center text-gray-400">Loading...</td></tr>
+                                        ) : filteredComplaints.length === 0 ? (
+                                            <tr><td colSpan="9" className="py-8 text-center text-gray-400">No complaints found.</td></tr>
+                                        ) : filteredComplaints.map(c => (
                                             <tr key={c.id} className="border-b hover:bg-purple-50">
-                                                <td className="py-3 px-4 text-purple-600 font-semibold">#{c.id}</td>
                                                 <td className="py-3 px-4">{c.passengerName}</td>
                                                 <td className="py-3 px-4 max-w-xs truncate">{c.complaintText}</td>
                                                 <td className="py-3 px-4 text-gray-600">{c.department || c.category || "-"}</td>
                                                 <td className="py-3 px-4 text-gray-400">{c.station || "-"}</td>
                                                 <td className="py-3 px-4 text-gray-400">{c.assignedTo || "-"}</td>
+                                                <td className="py-3 px-4 text-gray-500 text-xs">
+                                                    {c.status === "RESOLVED"
+                                                        ? (c.resolvedBy ? `${c.resolvedBy}${c.resolvedByRole ? ` (${c.resolvedByRole})` : ""}` : "Unknown")
+                                                        : "-"}
+                                                </td>
                                                 <td className="py-3 px-4">
                                                     <span className={`px-2 py-1 rounded text-xs font-semibold ${c.status === "RESOLVED" ? "bg-green-100 text-green-700" : c.status === "IN_PROGRESS" ? "bg-yellow-100 text-yellow-700" : "bg-red-100 text-red-700"}`}>{c.status}</span>
                                                 </td>
                                                 <td className="py-3 px-4 text-gray-400">{c.createdAt?.split("T")[0]}</td>
+                                                <td className="py-3 px-4">
+                                                    <button
+                                                        onClick={() => handleDeleteComplaint(c.id)}
+                                                        className="bg-red-100 text-red-700 text-xs px-2 py-1 rounded hover:bg-red-200"
+                                                    >
+                                                        Delete
+                                                    </button>
+                                                </td>
                                             </tr>
                                         ))}
                                     </tbody>

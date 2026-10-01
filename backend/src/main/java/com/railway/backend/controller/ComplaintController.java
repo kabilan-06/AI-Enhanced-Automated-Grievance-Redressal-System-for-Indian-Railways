@@ -74,4 +74,15 @@ public class ComplaintController {
             @Valid @RequestBody RemarkUpdateRequest request) {
         return ResponseEntity.ok(complaintService.updateRemarks(id, request.getRemarks()));
     }
+
+    @PatchMapping("/{id}/notify-rpf")
+    public ResponseEntity<ComplaintResponse> notifyRpf(@PathVariable Long id, Authentication authentication) {
+        return ResponseEntity.ok(complaintService.notifyRpf(id, authentication));
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deleteComplaint(@PathVariable Long id, Authentication authentication) {
+        complaintService.deleteComplaint(id, authentication);
+        return ResponseEntity.noContent().build();
+    }
 }

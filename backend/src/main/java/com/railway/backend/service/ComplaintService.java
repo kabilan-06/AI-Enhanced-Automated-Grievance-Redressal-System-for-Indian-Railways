@@ -2,8 +2,11 @@ package com.railway.backend.service;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.railway.backend.dto.ComplaintClassificationUpdateRequest;
 import com.railway.backend.dto.ComplaintRequest;
 import com.railway.backend.dto.ComplaintResponse;
+import com.railway.backend.dto.InternalComplaintDto;
+import com.railway.backend.dto.KafkaComplaintMessage;
 import com.railway.backend.dto.StatusUpdateRequest;
 import com.railway.backend.entity.Complaint;
 import com.railway.backend.entity.ComplaintHistory;
@@ -18,6 +21,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpEntity;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
+import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.Authentication;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -32,6 +36,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Stream;
 import java.util.stream.Collectors;
 
@@ -42,7 +47,7 @@ public class ComplaintService {
     private final ComplaintRepository complaintRepository;
     private final ComplaintHistoryRepository complaintHistoryRepository;
     private final UserRepository userRepository;
-    private final KafkaTemplate<String, Long> kafkaTemplate;
+    private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final RestTemplate restTemplate = new RestTemplate();
 
@@ -52,6 +57,8 @@ public class ComplaintService {
     private boolean aiEnabled;
     @Value("${app.ai.classifier-url:https://midhun-2542-railwaymodel.hf.space/classify}")
     private String aiClassifierUrl;
+    @Value("${app.kafka.topic:complaint-classification}")
+    private String kafkaTopic;
 
     public List<ComplaintResponse> getAllComplaints(Authentication auth) {
         if (auth != null) {
@@ -172,6 +179,7 @@ public class ComplaintService {
                 .trainNumber(request.getTrainNumber())
                 .incidentAt(request.getIncidentAt())
                 .category(category)
+                .rpfEscalated(Boolean.FALSE)
                 .status("PENDING")
                 .urgencyScore(0)
                 .station(station)
@@ -180,16 +188,59 @@ public class ComplaintService {
                 .aiMetadata(null)
                 .build();
 
-        enrichWithAi(complaint);
         Complaint saved = complaintRepository.save(complaint);
-        if (kafkaEnabled) {
+        if (aiEnabled && kafkaEnabled) {
+            KafkaComplaintMessage kafkaMessage = KafkaComplaintMessage.builder()
+                    .id(saved.getId())
+                    .complaintText(saved.getComplaintText())
+                    .trainNumber(saved.getTrainNumber())
+                    .previousStation(saved.getPreviousStation())
+                    .nextStation(saved.getNextStation())
+                    .build();
             try {
-                kafkaTemplate.send("complaint-classification", saved.getId());
+                kafkaTemplate.send(kafkaTopic, objectMapper.writeValueAsString(kafkaMessage)).get(10, TimeUnit.SECONDS);
+                saved.setAiMetadata(objectMapper.writeValueAsString(Map.of(
+                        "status", "QUEUED",
+                        "topic", kafkaTopic)));
+                saved = complaintRepository.save(saved);
             } catch (Exception ex) {
+                saved.setAiMetadata(buildKafkaFailureMetadata(ex));
+                complaintRepository.save(saved);
                 log.warn("Kafka publish failed for complaint id {}. Complaint is saved; AI enrichment deferred.", saved.getId(), ex);
             }
+        } else {
+            enrichWithAi(saved);
+            saved = complaintRepository.save(saved);
         }
         return toResponse(saved);
+    }
+
+    public InternalComplaintDto getComplaintForMl(Long id) {
+        Complaint complaint = complaintRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Complaint not found"));
+        return InternalComplaintDto.builder()
+                .id(complaint.getId())
+                .complaintText(complaint.getComplaintText())
+                .build();
+    }
+
+    @Transactional
+    public void applyClassificationResult(Long id, ComplaintClassificationUpdateRequest request) {
+        Complaint complaint = complaintRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Complaint not found"));
+
+        String department = request.getDepartment();
+        if (department == null || department.isBlank()) {
+            department = inferDepartmentFromText(complaint.getComplaintText());
+        }
+
+        complaint.setDepartment(department);
+        complaint.setCategory(department);
+        complaint.setUrgencyScore(request.getUrgencyScore() != null
+                ? request.getUrgencyScore()
+                : baselineUrgencyForDepartment(department, request.getPriority()));
+        complaint.setAiMetadata(request.getAiMetadata());
+        complaintRepository.save(complaint);
     }
 
     @Transactional
@@ -203,6 +254,7 @@ public class ComplaintService {
         if ("RESOLVED".equalsIgnoreCase(request.getNewStatus())) {
             complaint.setResolvedBy(resolveUserDisplayName(user));
             complaint.setResolvedByRole(user.getRole());
+            complaint.setRpfEscalated(Boolean.FALSE);
         } else {
             complaint.setResolvedBy(null);
             complaint.setResolvedByRole(null);
@@ -227,11 +279,65 @@ public class ComplaintService {
         return toResponse(complaintRepository.save(complaint));
     }
 
+    @Transactional
+    public ComplaintResponse notifyRpf(Long id, Authentication auth) {
+        Complaint complaint = complaintRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Complaint not found"));
+        User user = userRepository.findByUsername(auth.getName()).orElseThrow();
+        String oldStatus = complaint.getStatus();
+
+        complaint.setRpfEscalated(Boolean.TRUE);
+        if ("PENDING".equalsIgnoreCase(complaint.getStatus())) {
+            complaint.setStatus("IN_PROGRESS");
+        }
+
+        Complaint updated = complaintRepository.save(complaint);
+        ComplaintHistory history = ComplaintHistory.builder()
+                .complaint(complaint)
+                .oldStatus(oldStatus)
+                .newStatus(updated.getStatus())
+                .updatedBy(user)
+                .build();
+        complaintHistoryRepository.save(history);
+        return toResponse(updated);
+    }
+
+    @Transactional
+    public void deleteComplaint(Long id, Authentication auth) {
+        if (auth == null || auth.getName() == null || auth.getName().isBlank()) {
+            throw new AccessDeniedException("Only super admin can delete complaints");
+        }
+
+        User actor = userRepository.findByUsername(auth.getName())
+                .orElseThrow(() -> new AccessDeniedException("Only super admin can delete complaints"));
+
+        String role = actor.getRole() == null ? "" : actor.getRole().trim().toUpperCase(Locale.ROOT);
+        if (!"SUPER_ADMIN".equals(role)) {
+            throw new AccessDeniedException("Only super admin can delete complaints");
+        }
+
+        Complaint complaint = complaintRepository.findById(id)
+                .orElseThrow(() -> new RuntimeException("Complaint not found"));
+        complaintHistoryRepository.deleteByComplaintId(id);
+        complaintRepository.delete(complaint);
+    }
+
     private ComplaintResponse toResponse(Complaint complaint) {
         ComplaintResponse resp = new ComplaintResponse();
         String department = complaint.getDepartment();
+        String inferredDepartment = inferDepartmentFromText(complaint.getComplaintText());
         if (department == null || department.isBlank() || "GENERAL".equalsIgnoreCase(department) || "General".equalsIgnoreCase(department)) {
-            department = inferDepartmentFromText(complaint.getComplaintText());
+            department = inferredDepartment;
+        } else if (shouldOverrideDepartmentWithInference(department, inferredDepartment)) {
+            department = inferredDepartment;
+        }
+
+        Integer urgencyScore = complaint.getUrgencyScore();
+        int baselineUrgency = baselineUrgencyForDepartment(department, null);
+        if (shouldOverrideDepartmentWithInference(complaint.getDepartment(), inferredDepartment)) {
+            urgencyScore = baselineUrgency;
+        } else if (urgencyScore == null || urgencyScore < baselineUrgency) {
+            urgencyScore = baselineUrgency;
         }
 
         resp.setId(complaint.getId());
@@ -239,7 +345,7 @@ public class ComplaintService {
         resp.setPassengerPhone(complaint.getPassengerPhone());
         resp.setComplaintText(complaint.getComplaintText());
         resp.setCategory(department != null ? department : complaint.getCategory());
-        resp.setUrgencyScore(complaint.getUrgencyScore());
+        resp.setUrgencyScore(urgencyScore);
         resp.setStatus(complaint.getStatus());
         resp.setStation(complaint.getStation());
         resp.setPreviousStation(complaint.getPreviousStation());
@@ -251,10 +357,21 @@ public class ComplaintService {
         resp.setRemarks(complaint.getRemarks());
         resp.setResolvedBy(complaint.getResolvedBy());
         resp.setResolvedByRole(complaint.getResolvedByRole());
+        resp.setRpfEscalated(Boolean.TRUE.equals(complaint.getRpfEscalated()));
         resp.setAiMetadata(complaint.getAiMetadata());
         resp.setCreatedAt(complaint.getCreatedAt());
         resp.setUpdatedAt(complaint.getUpdatedAt());
         return resp;
+    }
+
+    private boolean shouldOverrideDepartmentWithInference(String storedDepartment, String inferredDepartment) {
+        if (inferredDepartment == null || inferredDepartment.isBlank()) {
+            return false;
+        }
+        if ("Security".equals(inferredDepartment) || "Medical".equals(inferredDepartment)) {
+            return storedDepartment == null || storedDepartment.isBlank() || !inferredDepartment.equalsIgnoreCase(storedDepartment);
+        }
+        return false;
     }
 
     private void enrichWithAi(Complaint complaint) {
@@ -278,7 +395,7 @@ public class ComplaintService {
             });
             String department = extractDepartment(payload);
             String priority = extractPriority(payload);
-            Integer urgencyScore = mapPriorityToUrgency(priority);
+            Integer urgencyScore = baselineUrgencyForDepartment(department, priority);
 
             if (department != null && !department.isBlank()) {
                 complaint.setDepartment(department);
@@ -305,8 +422,9 @@ public class ComplaintService {
             String inferredDepartment = inferDepartmentFromText(complaint.getComplaintText());
             complaint.setDepartment(inferredDepartment);
             complaint.setCategory(inferredDepartment);
-            if (complaint.getUrgencyScore() == null || complaint.getUrgencyScore() <= 0) {
-                complaint.setUrgencyScore(mapPriorityToUrgency(inferPriorityFromDepartment(inferredDepartment)));
+            int baselineUrgency = baselineUrgencyForDepartment(inferredDepartment, null);
+            if (complaint.getUrgencyScore() == null || complaint.getUrgencyScore() < baselineUrgency) {
+                complaint.setUrgencyScore(baselineUrgency);
             }
         }
     }
@@ -349,6 +467,24 @@ public class ComplaintService {
         return 35;
     }
 
+    private int baselineUrgencyForDepartment(String department, String priority) {
+        if (priority != null && !priority.isBlank()) {
+            return mapPriorityToUrgency(priority.trim().toLowerCase(Locale.ROOT));
+        }
+        return mapPriorityToUrgency(inferPriorityFromDepartment(department));
+    }
+
+    private String buildKafkaFailureMetadata(Exception ex) {
+        try {
+            return objectMapper.writeValueAsString(Map.of(
+                    "status", "FAILED",
+                    "topic", kafkaTopic,
+                    "error", ex.getClass().getSimpleName()));
+        } catch (Exception ignored) {
+            return "{\"status\":\"FAILED\",\"topic\":\"" + kafkaTopic + "\"}";
+        }
+    }
+
     private String inferPriorityFromDepartment(String department) {
         if (department == null) {
             return "low";
@@ -366,7 +502,36 @@ public class ComplaintService {
         }
         String normalized = text.toLowerCase();
 
-        if (containsAny(normalized, "security", "theft", "steal", "snatch", "rob", "fight", "harass", "unsafe", "police", "rpf", "sos")) {
+        if (containsAny(normalized,
+                "security",
+                "theft",
+                "steal",
+                "snatch",
+                "rob",
+                "fight",
+                "harass",
+                "unsafe",
+                "police",
+                "rpf",
+                "sos",
+                "suspicious",
+                "suspicious bag",
+                "unattended bag",
+                "unidentified",
+                "unknown person",
+                "unknown persons",
+                "unauthorized",
+                "trespass",
+                "force open",
+                "breaking open",
+                "threat",
+                "threaten",
+                "threatening",
+                "assault",
+                "abuse",
+                "molest",
+                "drunk passenger",
+                "smoking")) {
             return "Security";
         }
         if (containsAny(normalized, "medical", "doctor", "ambulance", "heart attack", "injury", "blood", "faint", "poison")) {

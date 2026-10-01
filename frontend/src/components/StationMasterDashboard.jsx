@@ -1,4 +1,4 @@
-﻿import React, { useEffect, useState, useContext } from "react";
+﻿import React, { useEffect, useState, useContext, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import API from "../api";
 import { AuthContext } from "../context/AuthContext";
@@ -24,7 +24,6 @@ const StationMasterDashboard = () => {
     const [loading, setLoading] = useState(true);
     const [activeSection, setActiveSection] = useState("Dashboard");
     const [filterStatus, setFilterStatus] = useState("");
-    const [escalatedIds, setEscalatedIds] = useState([]);
     const [activeRemark, setActiveRemark] = useState(null);
     const [remarkInput, setRemarkInput] = useState({});
     const [announcement, setAnnouncement] = useState({ team: "Cleaning", message: "" });
@@ -32,6 +31,8 @@ const StationMasterDashboard = () => {
     const [opIssues, setOpIssues] = useState({
         platform: "Normal", water: "Normal", electricity: "Normal", maintenance: "Pending",
     });
+    const [sosNotice, setSosNotice] = useState("");
+    const prevSosIdsRef = useRef(new Set());
 
     const stationName = user?.stationName || user?.station || "Your Station";
 
@@ -63,17 +64,17 @@ const StationMasterDashboard = () => {
         API.patch(`/complaints/${id}/status`, { newStatus })
             .then((res) => {
                 setComplaints(c => c.map(comp => comp.id === id ? res.data : comp));
-                if (newStatus === "RESOLVED") {
-                    setEscalatedIds(prev => prev.filter(x => x !== id));
-                }
             })
             .catch(() => { });
     };
 
 
     const handleEscalate = (id) => {
-        handleStatusUpdate(id, "IN_PROGRESS");
-        setEscalatedIds(prev => prev.includes(id) ? prev : [...prev, id]);
+        API.patch(`/complaints/${id}/notify-rpf`)
+            .then((res) => {
+                setComplaints(c => c.map(comp => comp.id === id ? res.data : comp));
+            })
+            .catch(() => { });
     };
 
     const handleAssign = (complaintId, staffUsername) => {
@@ -115,17 +116,51 @@ const StationMasterDashboard = () => {
     };
 
     const filteredComplaints = complaints.filter(c =>
-        filterStatus ? (escalatedIds.includes(c.id) ? "ESCALATED" : c.status) === filterStatus : true
+        filterStatus ? (c.rpfEscalated ? "ESCALATED" : c.status) === filterStatus : true
     );
 
-    const sosComplaints = complaints.filter(c =>
-        c.status !== "RESOLVED" && (
-            (c.complaintText || "").toLowerCase().includes("sos") ||
-            (c.complaintText || "").toLowerCase().includes("emergency") ||
-            (c.complaintText || "").toLowerCase().includes("help") ||
-            (c.urgencyScore || 0) >= 8
-        )
+    const isHighEmergency = (complaint) => {
+        const text = (complaint.complaintText || "").toLowerCase();
+        const highRiskKeyword =
+            text.includes("sos") ||
+            text.includes("emergency") ||
+            text.includes("attack") ||
+            text.includes("assault") ||
+            text.includes("harass") ||
+            text.includes("theft") ||
+            text.includes("snatch") ||
+            text.includes("fight") ||
+            text.includes("weapon") ||
+            text.includes("fire") ||
+            text.includes("bomb") ||
+            text.includes("medical emergency");
+        const highUrgency = (complaint.urgencyScore || 0) >= 80;
+        return highUrgency || highRiskKeyword;
+    };
+
+    const sosComplaints = complaints.filter(
+        (c) => c.status !== "RESOLVED" && isHighEmergency(c)
     );
+
+    useEffect(() => {
+        const currentIds = new Set(sosComplaints.map(c => c.id));
+        const previousIds = prevSosIdsRef.current;
+        const newOnes = sosComplaints.filter(c => !previousIds.has(c.id));
+
+        if (newOnes.length > 0) {
+            const sample = newOnes.slice(0, 3).map(c => `#${c.id}`).join(", ");
+            const extra = newOnes.length > 3 ? ` +${newOnes.length - 3} more` : "";
+            setSosNotice(`New SOS alert(s): ${sample}${extra}`);
+        }
+
+        prevSosIdsRef.current = currentIds;
+    }, [sosComplaints]);
+
+    useEffect(() => {
+        if (!sosNotice) return;
+        const timer = setTimeout(() => setSosNotice(""), 6000);
+        return () => clearTimeout(timer);
+    }, [sosNotice]);
 
     const today = new Date().toISOString().split("T")[0];
     const todayCount = complaints.filter(c => c.createdAt?.startsWith(today)).length;
@@ -147,7 +182,7 @@ const StationMasterDashboard = () => {
                     <div className="flex items-center gap-3">
                         <div className="w-10 h-10 bg-yellow-400 rounded-full flex items-center justify-center text-lg">🚉</div>
                         <div>
-                            <div className="font-bold text-white text-sm">RailMadad</div>
+                            <div className="font-bold text-white text-sm">RailPal</div>
                             <div className="text-teal-200 text-xs truncate max-w-[130px]">{stationName}</div>
                         </div>
                     </div>
@@ -184,17 +219,34 @@ const StationMasterDashboard = () => {
                 </div>
 
                 <div className="p-8">
+                    {sosNotice && (
+                        <div className="mb-4 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg flex flex-wrap items-center gap-3">
+                            <span className="text-sm font-semibold">{sosNotice}</span>
+                            <button
+                                onClick={() => setActiveSection("SOS Alerts")}
+                                className="ml-auto bg-red-600 text-white text-xs px-3 py-1 rounded hover:bg-red-700"
+                            >
+                                View SOS
+                            </button>
+                            <button
+                                onClick={() => setSosNotice("")}
+                                className="bg-gray-100 text-gray-700 text-xs px-3 py-1 rounded hover:bg-gray-200"
+                            >
+                                Dismiss
+                            </button>
+                        </div>
+                    )}
                     {/* ===== DASHBOARD ===== */}
                     {activeSection === "Dashboard" && (
                         <div>
                             <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
-                                {[
-                                    { label: "Total Complaints", value: complaints.length, color: "border-teal-500", text: "text-teal-600" },
-                                    { label: "Pending", value: complaints.filter(c => c.status === "PENDING").length, color: "border-red-500", text: "text-red-600" },
-                                    { label: "Resolved", value: complaints.filter(c => c.status === "RESOLVED").length, color: "border-green-500", text: "text-green-600" },
-                                    { label: "Escalated to RPF", value: escalatedIds.length, color: "border-purple-500", text: "text-purple-600" },
-                                    { label: "Active SOS", value: sosComplaints.length, color: "border-orange-500", text: "text-orange-600" },
-                                ].map(s => (
+                                    {[
+                                        { label: "Total Complaints", value: complaints.length, color: "border-teal-500", text: "text-teal-600" },
+                                        { label: "Pending", value: complaints.filter(c => c.status === "PENDING").length, color: "border-red-500", text: "text-red-600" },
+                                        { label: "Resolved", value: complaints.filter(c => c.status === "RESOLVED").length, color: "border-green-500", text: "text-green-600" },
+                                        { label: "Escalated to RPF", value: complaints.filter(c => c.rpfEscalated).length, color: "border-purple-500", text: "text-purple-600" },
+                                        { label: "Active SOS", value: sosComplaints.length, color: "border-orange-500", text: "text-orange-600" },
+                                    ].map(s => (
                                     <div key={s.label} className={`bg-white rounded-xl shadow p-5 border-l-4 ${s.color}`}>
                                         <div className={`text-3xl font-bold ${s.text}`}>{s.value}</div>
                                         <div className="text-gray-500 text-sm mt-1">{s.label}</div>
@@ -213,33 +265,6 @@ const StationMasterDashboard = () => {
                                 </div>
                             </div>
 
-                            {/* Station Operations Panel */}
-                            <div className="bg-white rounded-xl shadow p-6 mb-8">
-                                <h3 className="font-bold text-gray-800 mb-4">⚙️ Station Operations Status</h3>
-                                <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-                                    {[
-                                        { key: "platform", label: "Platform", icon: "🛤️" },
-                                        { key: "water", label: "Water / Sanitation", icon: "💧" },
-                                        { key: "electricity", label: "Electricity", icon: "⚡" },
-                                        { key: "maintenance", label: "Maintenance", icon: "🔧" },
-                                    ].map(op => (
-                                        <div key={op.key} className="border rounded-lg p-4">
-                                            <div className="text-2xl mb-1">{op.icon}</div>
-                                            <div className="text-sm font-semibold text-gray-700">{op.label}</div>
-                                            <select
-                                                value={opIssues[op.key]}
-                                                onChange={e => setOpIssues(prev => ({ ...prev, [op.key]: e.target.value }))}
-                                                className={`mt-2 text-xs font-bold rounded px-2 py-1 border-0 outline-none w-full ${opIssues[op.key] === "Normal" ? "bg-green-100 text-green-700" : opIssues[op.key] === "Pending" ? "bg-yellow-100 text-yellow-700" : "bg-red-100 text-red-700"}`}
-                                            >
-                                                <option value="Normal">Normal</option>
-                                                <option value="Pending">Pending</option>
-                                                <option value="Critical">Critical</option>
-                                            </select>
-                                        </div>
-                                    ))}
-                                </div>
-                            </div>
-
                             {/* Recent complaints */}
                             <div className="bg-white rounded-xl shadow">
                                 <div className="p-5 border-b flex justify-between items-center">
@@ -250,7 +275,6 @@ const StationMasterDashboard = () => {
                                     <table className="min-w-full text-sm">
                                         <thead className="bg-gray-50 text-gray-600">
                                             <tr>
-                                                <th className="py-3 px-4 text-left">#</th>
                                                 <th className="py-3 px-4 text-left">Passenger</th>
                                                 <th className="py-3 px-4 text-left">Complaint</th>
                                                 <th className="py-3 px-4 text-left">Status</th>
@@ -259,13 +283,12 @@ const StationMasterDashboard = () => {
                                         </thead>
                                         <tbody>
                                             {loading ? (
-                                                <tr><td colSpan="5" className="py-6 text-center text-gray-400">Loading...</td></tr>
+                                                <tr><td colSpan="4" className="py-6 text-center text-gray-400">Loading...</td></tr>
                                             ) : complaints.slice(0, 5).map(c => (
                                                 <tr key={c.id} className="border-b hover:bg-teal-50">
-                                                    <td className="py-3 px-4 text-teal-600 font-semibold">#{c.id}</td>
                                                     <td className="py-3 px-4">{c.passengerName}</td>
                                                     <td className="py-3 px-4 max-w-xs truncate">{c.complaintText}</td>
-                                                    <td className="py-3 px-4"><StatusBadge status={escalatedIds.includes(c.id) ? "ESCALATED" : c.status} /></td>
+                                                    <td className="py-3 px-4"><StatusBadge status={c.rpfEscalated ? "ESCALATED" : c.status} /></td>
                                                     <td className="py-3 px-4 text-gray-400">{c.createdAt?.split("T")[0]}</td>
                                                 </tr>
                                             ))}
@@ -280,8 +303,7 @@ const StationMasterDashboard = () => {
                                     {sosComplaints.slice(0, 2).map(c => (
                                         <div key={c.id} className="bg-white border border-red-200 rounded-lg p-3 mb-2 flex justify-between items-center">
                                             <div>
-                                                <span className="font-bold text-red-600">#{c.id}</span>
-                                                <span className="ml-2 text-gray-700">{c.passengerName}</span>
+                                                <span className="text-gray-700 font-semibold">{c.passengerName}</span>
                                                 <p className="text-gray-500 text-xs truncate">{c.complaintText}</p>
                                             </div>
                                             <button onClick={() => setActiveSection("SOS Alerts")} className="bg-red-600 text-white text-xs px-3 py-1 rounded hover:bg-red-700">Respond</button>
@@ -298,7 +320,7 @@ const StationMasterDashboard = () => {
                             <div className="p-5 border-b flex flex-wrap gap-3 items-center">
                                 <select value={filterStatus} onChange={e => setFilterStatus(e.target.value)}
                                     className="border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-teal-400">
-                                    <option value="">All Statuses</option>
+                                    <option value="">All Status</option>
                                     <option value="PENDING">Pending</option>
                                     <option value="IN_PROGRESS">In Progress</option>
                                     <option value="RESOLVED">Resolved</option>
@@ -325,7 +347,7 @@ const StationMasterDashboard = () => {
                                         ) : filteredComplaints.length === 0 ? (
                                             <tr><td colSpan="7" className="py-8 text-center text-gray-400">No complaints found.</td></tr>
                                         ) : filteredComplaints.map(c => {
-                                            const isEscalated = escalatedIds.includes(c.id);
+                                            const isEscalated = c.rpfEscalated;
                                             const displayStatus = isEscalated ? "ESCALATED" : c.status;
                                             return (
                                                 <tr key={c.id} className={`border-b ${isEscalated ? "bg-purple-50" : "hover:bg-teal-50"}`}>
@@ -346,26 +368,28 @@ const StationMasterDashboard = () => {
                                                     <td className="py-3 px-4"><StatusBadge status={displayStatus} /></td>
                                                     <td className="py-3 px-4 text-gray-400">{c.createdAt?.split("T")[0]}</td>
                                                     <td className="py-3 px-4">
-                                                        <div className="flex flex-wrap gap-1">
-                                                            <button onClick={() => setActiveRemark(activeRemark === c.id ? null : c.id)}
-                                                                className="bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded hover:bg-gray-200">Remark</button>
-                                                            {!isEscalated && c.status !== "RESOLVED" && !c.assignedTo && (
-                                                                <select defaultValue="" onChange={e => e.target.value && handleAssign(c.id, e.target.value)}
-                                                                    className="bg-blue-50 text-blue-700 text-xs px-2 py-1 rounded border border-blue-200">
-                                                                    <option value="" disabled>Assign</option>
-                                                                    {staffWithStats.map(s => <option key={s.id} value={s.username}>{s.displayName}</option>)}
-                                                                </select>
-                                                            )}
-                                                            {!isEscalated && c.status !== "RESOLVED" && (
-                                                                <button onClick={() => handleStatusUpdate(c.id, "RESOLVED")}
-                                                                    className="bg-green-500 text-white text-xs px-2 py-1 rounded hover:bg-green-600">Resolve</button>
-                                                            )}
-                                                            {!isEscalated && (
-                                                                <button onClick={() => handleEscalate(c.id)}
-                                                                    className="bg-purple-500 text-white text-xs px-2 py-1 rounded hover:bg-purple-600">↑ RPF</button>
-                                                            )}
-                                                        </div>
-                                                        {activeRemark === c.id && (
+                                                        {c.status !== "RESOLVED" && (
+                                                            <div className="flex flex-wrap gap-1">
+                                                                <button onClick={() => setActiveRemark(activeRemark === c.id ? null : c.id)}
+                                                                    className="bg-gray-100 text-gray-700 text-xs px-2 py-1 rounded hover:bg-gray-200">Remark</button>
+                                                                {!isEscalated && !c.assignedTo && (
+                                                                    <select defaultValue="" onChange={e => e.target.value && handleAssign(c.id, e.target.value)}
+                                                                        className="bg-blue-50 text-blue-700 text-xs px-2 py-1 rounded border border-blue-200">
+                                                                        <option value="" disabled>Assign</option>
+                                                                        {staffWithStats.map(s => <option key={s.id} value={s.username}>{s.displayName}</option>)}
+                                                                    </select>
+                                                                )}
+                                                                {!isEscalated && (
+                                                                    <button onClick={() => handleStatusUpdate(c.id, "RESOLVED")}
+                                                                        className="bg-green-500 text-white text-xs px-2 py-1 rounded hover:bg-green-600">Resolve</button>
+                                                                )}
+                                                                {!isEscalated && (
+                                                                    <button onClick={() => handleEscalate(c.id)}
+                                                                        className="bg-purple-500 text-white text-xs px-2 py-1 rounded hover:bg-purple-600">↑ RPF</button>
+                                                                )}
+                                                            </div>
+                                                        )}
+                                                        {activeRemark === c.id && c.status !== "RESOLVED" && (
                                                             <div className="mt-2 flex gap-2">
                                                                 <input
                                                                     type="text"
@@ -401,8 +425,8 @@ const StationMasterDashboard = () => {
                                     <div className="flex justify-between items-start">
                                         <div className="flex-1">
                                             <div className="flex items-center gap-2 mb-2">
-                                                <span className="text-red-600 font-bold text-lg animate-pulse">🚨 SOS #{c.id}</span>
-                                                <StatusBadge status={escalatedIds.includes(c.id) ? "ESCALATED" : c.status} />
+                                                <span className="text-red-600 font-bold text-lg animate-pulse">🚨 SOS</span>
+                                                <StatusBadge status={c.rpfEscalated ? "ESCALATED" : c.status} />
                                             </div>
                                             <p className="font-semibold text-gray-800 text-lg">{c.passengerName}</p>
                                             <p className="text-gray-600 mt-1">{c.complaintText}</p>
@@ -441,7 +465,6 @@ const StationMasterDashboard = () => {
                             <div className="bg-white rounded-xl shadow p-6">
                                 <h3 className="font-bold text-gray-800 mb-2">Station Staff Roster</h3>
                                 <p className="text-sm text-gray-500">
-                                    Staff accounts are managed centrally by Super Admin. This view is synced from backend users.
                                 </p>
                             </div>
                             <div className="bg-white rounded-xl shadow overflow-hidden">
@@ -533,7 +556,7 @@ const StationMasterDashboard = () => {
                                     {[
                                         { label: "Total Complaints", value: complaints.length, icon: "📋" },
                                         { label: "Resolved", value: complaints.filter(c => c.status === "RESOLVED").length, icon: "✅" },
-                                        { label: "Escalated to RPF", value: escalatedIds.length, icon: "↑" },
+                                        { label: "Escalated to RPF", value: complaints.filter(c => c.rpfEscalated).length, icon: "↑" },
                                         { label: "Pending", value: complaints.filter(c => c.status === "PENDING").length, icon: "⏳" },
                                         { label: "Station Staff", value: staffWithStats.length, icon: "👷" },
                                         { label: "Resolution Rate", value: `${resolutionRate}%`, icon: "📈" },
